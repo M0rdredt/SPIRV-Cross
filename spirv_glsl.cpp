@@ -327,6 +327,8 @@ void CompilerGLSL::reset(uint32_t iteration_count)
 	// Ensure that we declare phi-variable copies even if the original declaration isn't deferred
 	flushed_phi_variables.clear();
 
+	current_emitting_switch_stack.clear();
+
 	reset_name_caches();
 
 	ir.for_each_typed_id<SPIRFunction>([&](uint32_t, SPIRFunction &func) {
@@ -8990,6 +8992,7 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
 		if (!is_literal)
 			mod_flags &= ~ACCESS_CHAIN_INDEX_IS_LITERAL_BIT;
 		access_chain_internal_append_index(expr, base, type, mod_flags, access_chain_is_arrayed, index);
+		check_physical_type_cast(expr, type, physical_type);
 	};
 
 	for (uint32_t i = 0; i < count; i++)
@@ -9320,6 +9323,10 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
 	}
 
 	return expr;
+}
+
+void CompilerGLSL::check_physical_type_cast(std::string &, const SPIRType *, uint32_t)
+{
 }
 
 void CompilerGLSL::prepare_access_chain_for_scalar_access(std::string &, const SPIRType &, spv::StorageClass, bool &)
@@ -14890,21 +14897,32 @@ void CompilerGLSL::branch(BlockID from, BlockID to)
 		// - Break merge target all at once ...
 
 		// Very dirty workaround.
-		// Switch constructs are able to break, but they cannot break out of a loop at the same time.
+		// Switch constructs are able to break, but they cannot break out of a loop at the same time,
+		// yet SPIR-V allows it.
 		// Only sensible solution is to make a ladder variable, which we declare at the top of the switch block,
 		// write to the ladder here, and defer the break.
 		// The loop we're breaking out of must dominate the switch block, or there is no ladder breaking case.
-		if (current_emitting_switch && is_loop_break(to) &&
-		    current_emitting_switch->loop_dominator != BlockID(SPIRBlock::NoDominator) &&
-		    get<SPIRBlock>(current_emitting_switch->loop_dominator).merge_block == to)
+		if (is_loop_break(to))
 		{
-			if (!current_emitting_switch->need_ladder_break)
+			for (size_t n = current_emitting_switch_stack.size(); n; n--)
 			{
-				force_recompile();
-				current_emitting_switch->need_ladder_break = true;
-			}
+				auto *current_emitting_switch = current_emitting_switch_stack[n - 1];
 
-			statement("_", current_emitting_switch->self, "_ladder_break = true;");
+				if (current_emitting_switch &&
+				    current_emitting_switch->loop_dominator != BlockID(SPIRBlock::NoDominator) &&
+				    get<SPIRBlock>(current_emitting_switch->loop_dominator).merge_block == to)
+				{
+					if (!current_emitting_switch->need_ladder_break)
+					{
+						force_recompile();
+						current_emitting_switch->need_ladder_break = true;
+					}
+
+					statement("_", current_emitting_switch->self, "_ladder_break = true;");
+				}
+				else
+					break;
+			}
 		}
 		statement("break;");
 	}
@@ -15589,8 +15607,7 @@ void CompilerGLSL::emit_block_chain(SPIRBlock &block)
 		else if (type.basetype == SPIRType::Short)
 			label_suffix = backend.int16_t_literal_suffix;
 
-		SPIRBlock *old_emitting_switch = current_emitting_switch;
-		current_emitting_switch = &block;
+		current_emitting_switch_stack.push_back(&block);
 
 		if (block.need_ladder_break)
 			statement("bool _", block.self, "_ladder_break = false;");
@@ -15748,26 +15765,32 @@ void CompilerGLSL::emit_block_chain(SPIRBlock &block)
 		// If there is only one default block, and no cases, this is a case where SPIRV-opt decided to emulate
 		// non-structured exits with the help of a switch block.
 		// This is buggy on FXC, so just emit the logical equivalent of a do { } while(false), which is more idiomatic.
-		bool degenerate_switch = block.default_block != block.merge_block && cases.empty();
+		bool block_like_switch = cases.empty();
 
-		if (degenerate_switch || is_legacy_es())
+		// If this is true, the switch is completely meaningless, and we should just avoid it.
+		bool collapsed_switch = block_like_switch && block.default_block == block.next_block;
+
+		if (!collapsed_switch)
 		{
-			// ESSL 1.0 is not guaranteed to support do/while.
-			if (is_legacy_es())
+			if (block_like_switch || is_legacy_es())
 			{
-				uint32_t counter = statement_count;
-				statement("for (int spvDummy", counter, " = 0; spvDummy", counter,
-				          " < 1; spvDummy", counter, "++)");
+				// ESSL 1.0 is not guaranteed to support do/while.
+				if (is_legacy_es())
+				{
+					uint32_t counter = statement_count;
+					statement("for (int spvDummy", counter, " = 0; spvDummy", counter, " < 1; spvDummy", counter,
+					          "++)");
+				}
+				else
+					statement("do");
 			}
 			else
-				statement("do");
+			{
+				emit_block_hints(block);
+				statement("switch (", to_unpacked_expression(block.condition), ")");
+			}
+			begin_scope();
 		}
-		else
-		{
-			emit_block_hints(block);
-			statement("switch (", to_unpacked_expression(block.condition), ")");
-		}
-		begin_scope();
 
 		for (size_t i = 0; i < num_blocks; i++)
 		{
@@ -15777,7 +15800,7 @@ void CompilerGLSL::emit_block_chain(SPIRBlock &block)
 			if (literals.empty())
 			{
 				// Default case.
-				if (!degenerate_switch)
+				if (!block_like_switch)
 				{
 					if (is_legacy_es())
 						statement("else");
@@ -15815,10 +15838,10 @@ void CompilerGLSL::emit_block_chain(SPIRBlock &block)
 			else
 				current_emitting_switch_fallthrough = false;
 
-			if (!degenerate_switch)
+			if (!block_like_switch)
 				begin_scope();
 			branch(block.self, target_block);
-			if (!degenerate_switch)
+			if (!block_like_switch)
 				end_scope();
 
 			current_emitting_switch_fallthrough = false;
@@ -15832,7 +15855,7 @@ void CompilerGLSL::emit_block_chain(SPIRBlock &block)
 		// - Header -> Merge requires flushing PHI. In this case, we need to collect all cases and flush PHI there.
 		bool header_merge_requires_phi = flush_phi_required(block.self, block.next_block);
 		bool need_fallthrough_block = block.default_block == block.next_block || !literals_to_merge.empty();
-		if ((header_merge_requires_phi && need_fallthrough_block) || !literals_to_merge.empty())
+		if (!collapsed_switch && ((header_merge_requires_phi && need_fallthrough_block) || !literals_to_merge.empty()))
 		{
 			for (auto &case_literal : literals_to_merge)
 				statement("case ", to_case_label(case_literal, type.width, unsigned_case), label_suffix, ":");
@@ -15851,10 +15874,15 @@ void CompilerGLSL::emit_block_chain(SPIRBlock &block)
 			end_scope();
 		}
 
-		if (degenerate_switch && !is_legacy_es())
-			end_scope_decl("while(false)");
+		if (!collapsed_switch)
+		{
+			if (block_like_switch && !is_legacy_es())
+				end_scope_decl("while(false)");
+			else
+				end_scope();
+		}
 		else
-			end_scope();
+			flush_phi(block.self, block.next_block);
 
 		if (block.need_ladder_break)
 		{
@@ -15864,7 +15892,7 @@ void CompilerGLSL::emit_block_chain(SPIRBlock &block)
 			end_scope();
 		}
 
-		current_emitting_switch = old_emitting_switch;
+		current_emitting_switch_stack.pop_back();
 		break;
 	}
 
